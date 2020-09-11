@@ -1,8 +1,9 @@
 # Do not modify these two lines. If you wish to change these variables,
 # modify them in /etc/default/kudu-master.
---fromenv=rpc_bind_addresses
---fromenv=log_dir
+-fromenv=rpc_bind_addresses
+-fromenv=log_dir
 
---fs_wal_dir=/var/lib/kudu/masterwal
---fs_data_dirs=/var/lib/kudu/masterdata
---webserver_doc_root=/opt/kudu/www
+-fs_wal_dir=/var/lib/kudu/masterwal
+-fs_data_dirs=/var/lib/kudu/masterdata
+-webserver_doc_root=/opt/kudu/www
+-superuser_acl=*

@@ -40,6 +40,13 @@ function remove_kudu_user() {
   fi
 }
 
+# assume the directories are already created
+function refresh_conf() {
+  local node=$1
+  scp -r conf ${node}:~
+  ssh ${node} "sudo mv conf/* ${CONF_DIR}/"
+}
+
 function copy_install_bin() {
   local node=$1
   ## create bin dir, copy bins
