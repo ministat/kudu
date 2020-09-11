@@ -356,6 +356,8 @@ RUN groupadd -g ${GID} kudu || groupmod -n kudu $(getent group ${GID} | cut -d: 
 # Copy the binaries.
 WORKDIR $INSTALL_DIR/bin
 COPY --chown=kudu:kudu --from=build ${BUILD_DIR}/build/latest/bin/kudu ./
+COPY --chown=kudu:kudu --from=build ${BUILD_DIR}/build/latest/bin/kudu-master ./
+COPY --chown=kudu:kudu --from=build ${BUILD_DIR}/build/latest/bin/kudu-tserver ./
 # Add to the binaries to the path.
 ENV PATH=$INSTALL_DIR/bin/:$PATH
 
