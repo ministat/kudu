@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
@@ -45,6 +46,7 @@
 #include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -52,6 +54,20 @@
 #include "kudu/util/status.h"
 #include "kudu/util/thread_restrictions.h"
 #include "kudu/util/threadpool.h"
+
+DEFINE_string(sasl_krb5_principal_name, "kudu",
+              "The kerberos primary principal name which is used for the SASL negotiation.");
+TAG_FLAG(sasl_krb5_principal_name, advanced);
+
+// whitespace is not allowed
+DEFINE_validator(sasl_krb5_principal_name, [](const char*, const std::string& v) {
+  for (auto it = v.cbegin(); it != v.cend(); ++it) {
+    if (std::isspace(*it)) {
+      return false;
+    }
+  }
+  return true;
+});
 
 using std::string;
 using std::shared_ptr;
@@ -72,7 +88,7 @@ MessengerBuilder::MessengerBuilder(std::string name)
       max_negotiation_threads_(4),
       coarse_timer_granularity_(MonoDelta::FromMilliseconds(100)),
       rpc_negotiation_timeout_ms_(kRpcNegotiationTimeoutMs),
-      sasl_proto_name_("kudu"),
+      sasl_proto_name_(FLAGS_sasl_krb5_principal_name),
       rpc_authentication_("optional"),
       rpc_encryption_("optional"),
       rpc_tls_ciphers_(kudu::security::SecurityDefaults::kDefaultTlsCiphers),

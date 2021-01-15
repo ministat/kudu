@@ -73,6 +73,7 @@
 #include "kudu/util/test_util.h"
 
 DECLARE_string(local_ip_for_outbound_sockets);
+DECLARE_string(sasl_krb5_principal_name);
 
 using kudu::client::KuduClient;
 using kudu::client::KuduClientBuilder;
@@ -221,6 +222,22 @@ void SecurityITest::SmokeTestCluster() {
 
   // Delete the table.
   ASSERT_OK(client->DeleteTable(kTableName));
+}
+
+// Test customized SASL protocol name.
+TEST_F(SecurityITest, TestSaslProtoName) {
+  cluster_opts_.extra_master_flags.emplace_back("--sasl_krb5_principal_name=kudu");
+  cluster_opts_.extra_tserver_flags.emplace_back("--sasl_krb5_principal_name=kudu");
+  ASSERT_OK(StartCluster());
+  string master_host = cluster_->GetBindIpForMaster(0);
+  string spn = Substitute("$0/$1@$2",
+                          FLAGS_sasl_krb5_principal_name,
+                          master_host,
+                          cluster_opts_.mini_kdc_options.realm);
+  string krb5_path;
+  ASSERT_OK(cluster_->kdc()->CreateServiceKeytab(spn, &krb5_path));
+  CHECK_ERR(setenv("KRB5_KTNAME", krb5_path.c_str(), 1));
+  ASSERT_OK(TryListTablets());
 }
 
 // Test authorizing list tablets.

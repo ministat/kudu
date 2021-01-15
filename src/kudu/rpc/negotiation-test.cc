@@ -1156,6 +1156,17 @@ TEST_F(TestNegotiation, TestGSSAPIInvalidNegotiation) {
 #endif
 
 #ifndef __APPLE__
+TEST_F(TestNegotiation, TestCustomizeSaslProtoPreflight) {
+  // Try with a valid krb5 environment and keytab.
+  MiniKdc kdc;
+  ASSERT_OK(kdc.Start());
+  ASSERT_OK(kdc.SetKrb5Environment());
+  string kt_path;
+  ASSERT_OK(kdc.CreateServiceKeytab("test-kudu/127.0.0.1", &kt_path));
+  CHECK_ERR(setenv("KRB5_KTNAME", kt_path.c_str(), 1 /*replace*/));
+
+  ASSERT_OK(ServerNegotiation::PreflightCheckGSSAPI("test-kudu"));
+}
 // Test that the pre-flight check for servers requiring Kerberos provides
 // nice error messages for missing or bad keytabs.
 //
