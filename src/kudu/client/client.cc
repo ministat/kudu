@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <set>
@@ -399,6 +400,24 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
   return Status::OK();
 }
 
+KuduTransaction::SerializationOptions::SerializationOptions()
+    : data_(new Data) {
+}
+
+KuduTransaction::SerializationOptions::~SerializationOptions() {
+  delete data_;
+}
+
+bool KuduTransaction::SerializationOptions::keepalive() const {
+  return data_->enable_keepalive_;
+}
+
+KuduTransaction::SerializationOptions&
+KuduTransaction::SerializationOptions::enable_keepalive(bool enable) {
+  data_->enable_keepalive_ = enable;
+  return *this;
+}
+
 KuduTransaction::KuduTransaction(const sp::shared_ptr<KuduClient>& client)
     : data_(new KuduTransaction::Data(client)) {
 }
@@ -424,29 +443,16 @@ Status KuduTransaction::Rollback() {
   return data_->Rollback();
 }
 
+Status KuduTransaction::Serialize(
+    string* serialized_txn,
+    const SerializationOptions& options) const {
+  return data_->Serialize(serialized_txn, options);
+}
+
 Status KuduTransaction::Deserialize(const sp::shared_ptr<KuduClient>& client,
                                     const string& serialized_txn,
                                     sp::shared_ptr<KuduTransaction>* txn) {
   return Data::Deserialize(client, serialized_txn, txn);
-}
-
-KuduTransactionSerializer::KuduTransactionSerializer(
-    const sp::shared_ptr<KuduTransaction>& txn)
-    : data_(new KuduTransactionSerializer::Data(txn)) {
-}
-
-KuduTransactionSerializer::~KuduTransactionSerializer() {
-  delete data_;
-}
-
-KuduTransactionSerializer&
-KuduTransactionSerializer::enable_keepalive(bool enable) {
-  data_->enable_keepalive(enable);
-  return *this;
-}
-
-Status KuduTransactionSerializer::Serialize(string* serialized_txn) const {
-  return data_->Serialize(serialized_txn);
 }
 
 KuduClient::KuduClient()
@@ -1620,12 +1626,12 @@ Status KuduScanner::SetTimeoutMillis(int millis) {
 }
 
 Status KuduScanner::AddConjunctPredicate(KuduPredicate* pred) {
+  // Take ownership even if returning non-OK status.
+  unique_ptr<KuduPredicate> p(pred);
   if (data_->open_) {
-    // Take ownership even if we return a bad status.
-    delete pred;
     return Status::IllegalState("Predicate must be set before Open()");
   }
-  return data_->mutable_configuration()->AddConjunctPredicate(pred);
+  return data_->mutable_configuration()->AddConjunctPredicate(std::move(p));
 }
 
 Status KuduScanner::AddLowerBound(const KuduPartialRow& key) {
@@ -2038,7 +2044,8 @@ Status KuduScanTokenBuilder::IncludeTabletMetadata(bool include_metadata) {
 }
 
 Status KuduScanTokenBuilder::AddConjunctPredicate(KuduPredicate* pred) {
-  return data_->mutable_configuration()->AddConjunctPredicate(pred);
+  unique_ptr<KuduPredicate> p(pred);
+  return data_->mutable_configuration()->AddConjunctPredicate(std::move(p));
 }
 
 Status KuduScanTokenBuilder::AddLowerBound(const KuduPartialRow& key) {

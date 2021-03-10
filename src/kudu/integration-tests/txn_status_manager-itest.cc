@@ -111,6 +111,11 @@ class TxnStatusManagerITest : public ExternalMiniClusterITestBase {
         "--raft_heartbeat_interval_ms=$0", kRaftHbIntervalMs));
     cluster_opts_.extra_tserver_flags.emplace_back(
         "--leader_failure_max_missed_heartbeat_periods=1.25");
+
+    // Some of these tests rely on checking state assuming no background tasks.
+    // For simplicity, disable the background commits.
+    cluster_opts_.extra_tserver_flags.emplace_back(
+        "--txn_schedule_background_tasks=false");
   }
 
   void SetUp() override {
@@ -238,28 +243,11 @@ class TxnStatusManagerITest : public ExternalMiniClusterITestBase {
 
 const MonoDelta TxnStatusManagerITest::kTimeout = MonoDelta::FromSeconds(15);
 
-// TODO(aserbin): enable all scenarios below once [1] is committed. Without [1],
-//                these scenarios sometimes fails upon calling GetTxnState():
-//
-//   Bad status: Not found: Failed to write to server:
-//   7c968757cc19497a93b15b6c6a48e446 (127.13.78.3:33027):
-//   transaction ID 0 not found, current highest txn ID: -1
-//
-//                The issue here is that a non-leader replica might load
-//                the information from tablet that's lagging behind the
-//                leader, and once the replica becomes a new leader later on,
-//                the information is stale because TxnStatusManager's data
-//                isn't yet reloaded upon the becoming a leader. Once the
-//                patch above is merged, remove this TODO and remove '#if 0'
-//                for the code below.
-//
-//                [1] https://gerrit.cloudera.org/#/c/16648/
-
 // The test to verify basic functionality of the transaction tracker: it should
 // detect transactions that haven't received KeepTransactionAlive() requests
 // for longer than the transaction's keepalive interval and automatically abort
 // those.
-TEST_F(TxnStatusManagerITest, DISABLED_StaleTransactionsCleanup) {
+TEST_F(TxnStatusManagerITest, StaleTransactionsCleanup) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Check that the transaction staleness is detected and the stale transaction
@@ -278,7 +266,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_StaleTransactionsCleanup) {
     // and abort it. An extra margin here is to avoid flakiness due to
     // scheduling anomalies.
     SleepFor(MonoDelta::FromMilliseconds(3 * keepalive_interval_ms));
-    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
   }
 
   // Check that the transaction staleness is detected and the stale transaction
@@ -300,7 +288,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_StaleTransactionsCleanup) {
 // Make sure it's possible to disable and enable back the transaction
 // staleness tracking in run-time without restarting the processes hosting
 // TxnStatusManager instances (i.e. tablet servers).
-TEST_F(TxnStatusManagerITest, DISABLED_ToggleStaleTxnTrackerInRuntime) {
+TEST_F(TxnStatusManagerITest, ToggleStaleTxnTrackerInRuntime) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
   // Disable txn transaction tracking in run-time.
@@ -333,7 +321,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_ToggleStaleTxnTrackerInRuntime) {
   // Check that the transaction staleness is detected and the stale transaction
   // is aborted once stale transaction tracking is re-enabled.
   SleepFor(MonoDelta::FromMilliseconds(3 * keepalive_interval_ms));
-  NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+  NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
 }
 
 // Verify the functionality of the stale transaction tracker in TxnStatusManager
@@ -341,7 +329,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_ToggleStaleTxnTrackerInRuntime) {
 // sure that a transaction isn't aborted if keepalive requests are sent as
 // required even in case of Raft leader re-elections and restarts
 // of the TxnStatusManager instances.
-TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstances) {
+TEST_F(TxnStatusManagerITest, TxnKeepAliveMultiTxnStatusManagerInstances) {
   SKIP_IF_SLOW_NOT_ALLOWED();
 
   int64_t txn_id;
@@ -355,8 +343,8 @@ TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstance
   CountDownLatch latch(1);
   Status keep_txn_alive_status;
   thread txn_keepalive_sender([&] {
-    const auto period = MonoDelta::FromMilliseconds(keepalive_interval_ms / 2);
-    const auto timeout = MonoDelta::FromMilliseconds(keepalive_interval_ms / 4);
+    const auto period = MonoDelta::FromMilliseconds(keepalive_interval_ms / 5);
+    const auto timeout = MonoDelta::FromMilliseconds(keepalive_interval_ms / 10);
     // Keepalive thread uses its own messenger and proxy.
     std::shared_ptr<rpc::Messenger> m;
     rpc::MessengerBuilder b("txn-keepalive");
@@ -462,7 +450,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstance
   // should be automatically aborted by TxnStatusManager running with the
   // leader replica of the txn status tablet.
   ASSERT_EVENTUALLY([&]{
-    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORTED));
+    NO_FATALS(CheckTxnState(txn_id, TxnStatePB::ABORT_IN_PROGRESS));
   });
 
   NO_FATALS(cluster_->AssertNoCrashes());
@@ -473,7 +461,7 @@ TEST_F(TxnStatusManagerITest, DISABLED_TxnKeepAliveMultiTxnStatusManagerInstance
 // accessible for some time, and the txn keepalive messages reach the
 // destination after TxnStatusManager is back online. So, the txn should not be
 // auto-aborted when its KuduTransaction objects is kept in the scope.
-TEST_F(TxnStatusManagerITest, DISABLED_TxnKeptAliveByClientIfStatusManagerRestarted) {
+TEST_F(TxnStatusManagerITest, TxnKeptAliveByClientIfStatusManagerRestarted) {
   SKIP_IF_SLOW_NOT_ALLOWED();
   shared_ptr<KuduClient> c;
   ASSERT_OK(cluster_->CreateClient(nullptr, &c));

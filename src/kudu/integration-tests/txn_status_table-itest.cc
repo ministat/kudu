@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -62,7 +63,14 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(raft_enable_pre_election);
+DECLARE_bool(txn_schedule_background_tasks);
+DECLARE_bool(txn_status_tablet_failover_inject_timeout_error);
+DECLARE_bool(txn_status_tablet_inject_load_failure_error);
+DECLARE_bool(txn_status_tablet_inject_uninitialized_leader_status_error);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(consensus_inject_latency_ms_in_notifications);
+DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_string(superuser_acl);
 DECLARE_string(user_acl);
 DECLARE_uint32(txn_keepalive_interval_ms);
@@ -81,6 +89,7 @@ using kudu::transactions::TxnStatePB;
 using kudu::transactions::TxnStatusEntryPB;
 using kudu::transactions::TxnStatusTablet;
 using kudu::transactions::TxnSystemClient;
+using std::atomic;
 using std::map;
 using std::string;
 using std::thread;
@@ -103,6 +112,9 @@ class TxnStatusTableITest : public KuduTest {
 
   void SetUp() override {
     KuduTest::SetUp();
+    // Several of these tests rely on checking transaction state, which is
+    // easier to work with without committing in the background.
+    FLAGS_txn_schedule_background_tasks = false;
     cluster_.reset(new InternalMiniCluster(env_, {}));
     ASSERT_OK(cluster_->Start());
 
@@ -532,6 +544,38 @@ TEST_F(TxnStatusTableITest, SystemClientCommitAndAbortTransaction) {
   }
 }
 
+TEST_F(TxnStatusTableITest, TServerInitializesTxnSystemClient) {
+  auto* mts = cluster_->mini_tablet_server(0);
+  auto* client_initializer = mts->server()->txn_client_initializer();
+  TxnSystemClient* txn_client = nullptr;
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_initializer->GetClient(&txn_client));
+  });
+  // We should be able to get the client, and use it to make a call.
+  ASSERT_NE(txn_client, nullptr);
+  ASSERT_OK(txn_client->CreateTxnStatusTable(100));
+  txn_client = nullptr;
+
+  // Try shutting down the master, and then restarting the tablet server to
+  // attempt to rebuild a TxnSystemClient. This should fail until the master
+  // comes back up.
+  cluster_->mini_master()->Shutdown();
+  mts->Shutdown();
+  ASSERT_OK(mts->Restart());
+  client_initializer = mts->server()->txn_client_initializer();
+  Status s = client_initializer->GetClient(&txn_client);
+  ASSERT_TRUE(s.IsServiceUnavailable()) << s.ToString();
+  ASSERT_EQ(txn_client, nullptr);
+
+  ASSERT_OK(cluster_->mini_master()->Restart());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(client_initializer->GetClient(&txn_client));
+  });
+  // We should be able to get the client, and use it to make a call.
+  ASSERT_NE(txn_client, nullptr);
+  ASSERT_OK(txn_client->OpenTxnStatusTable());
+}
+
 TEST_F(TxnStatusTableITest, GetTransactionStatus) {
   const auto verify_state = [&](TxnStatePB state) {
     TxnStatusEntryPB txn_status;
@@ -552,12 +596,12 @@ TEST_F(TxnStatusTableITest, GetTransactionStatus) {
   NO_FATALS(verify_state(TxnStatePB::COMMIT_IN_PROGRESS));
 
   ASSERT_OK(txn_sys_client_->AbortTransaction(1, kUser));
-  NO_FATALS(verify_state(TxnStatePB::ABORTED));
+  NO_FATALS(verify_state(TxnStatePB::ABORT_IN_PROGRESS));
 
   {
     auto s = txn_sys_client_->BeginCommitTransaction(1, kUser);
     ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
-    NO_FATALS(verify_state(TxnStatePB::ABORTED));
+    NO_FATALS(verify_state(TxnStatePB::ABORT_IN_PROGRESS));
   }
 
   // In the negative scenarios below, check for the expected status code
@@ -616,6 +660,92 @@ TEST_F(TxnStatusTableITest, TestSystemClientConcurrentCalls) {
   for (const auto& s : statuses) {
     EXPECT_OK(s);
   }
+}
+
+// Check the operation of the CheckOpenTxnStatusTable() method; make sure
+// it's possible to register txn participants even with stale information
+// on the range parititions.
+TEST_F(TxnStatusTableITest, CheckOpenTxnStatusTable) {
+  static constexpr auto kPartitionWidth = 1000;
+  static constexpr const char* const kUser = "CheckOpen";
+
+  {
+    // At this point, the transaction status table doesn't exist yet.
+    auto s = txn_sys_client_->CheckOpenTxnStatusTable();
+    ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  }
+
+  ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(kPartitionWidth));
+  ASSERT_OK(txn_sys_client_->CheckOpenTxnStatusTable());
+  const auto* sys_table_ptr_ref = txn_sys_client_->txn_status_table().get();
+
+  cluster_->mini_master()->Shutdown();
+  // Now, once CheckOpenTxnStatusTable() succeeded, there should be no RPC calls
+  // to the cluster upon subsequent invocations, and CheckOpenTxnStatusTable()
+  // should return Status::OK(), keeping the original shared pointer.
+  ASSERT_OK(txn_sys_client_->CheckOpenTxnStatusTable());
+  const auto* sys_table_ptr = txn_sys_client_->txn_status_table().get();
+  ASSERT_EQ(sys_table_ptr_ref, sys_table_ptr);
+
+  ASSERT_OK(cluster_->mini_master()->Restart());
+  ASSERT_OK(txn_sys_client_->BeginTransaction(0, kUser));
+
+  static constexpr auto kNewTxnId = kPartitionWidth + 1;
+  {
+    // Behind the scenes, create tablets for the next transaction IDs range
+    // and start a new transaction.
+    unique_ptr<TxnSystemClient> tsc;
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &tsc));
+    // Re-open the system table.
+    ASSERT_OK(tsc->OpenTxnStatusTable());
+    ASSERT_OK(tsc->AddTxnStatusTableRange(kPartitionWidth, 2 * kPartitionWidth));
+    ASSERT_OK(tsc->BeginTransaction(kNewTxnId, kUser));
+  }
+
+  // It would be great if it were possible to use the same client which was not
+  // aware of a new range in the txn status table to register a participant
+  // in a transaction with ID in the new range. This assumes the client would
+  // automatically re-fetch metadata from masters upon getting a request
+  // for a non-covered range. However, this isn't implemented yet.
+  //
+  // TODO(aserbin): change this to expected Status::OK() after implementing that
+  auto s = txn_sys_client_->RegisterParticipant(
+      kNewTxnId, "txn_participant", kUser, MonoDelta::FromSeconds(10));
+  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(),
+                      "No tablet covering the requested range partition");
+}
+
+TEST_F(TxnStatusTableITest, CheckOpenTxnStatusTableConcurrent) {
+  static constexpr auto kNumThreads = 8;
+  static constexpr const char* const kUser = "CheckOpenConcurrent";
+  static constexpr const char* const kParticipant = "txn_participant";
+
+  ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(2 * kNumThreads));
+  atomic<size_t> success_count_begin = 0;
+  atomic<size_t> success_count_register = 0;
+  vector<thread> threads;
+  threads.reserve(kNumThreads);
+  for (int idx = 0; idx < kNumThreads; ++idx) {
+    threads.emplace_back([&] {
+      CHECK_OK(txn_sys_client_->CheckOpenTxnStatusTable());
+      // The call below is of "best effort" approach: the essence here is just
+      // to make concurrent requests to the txn system client once
+      // CheckOpenTxnStatusTable() has been called.
+      auto s = txn_sys_client_->BeginTransaction(0, kUser);
+      if (s.ok()) {
+        ++success_count_begin;
+      }
+      s = txn_sys_client_->RegisterParticipant(
+          0, kParticipant, kUser, MonoDelta::FromSeconds(10));
+      if (s.ok()) {
+        ++success_count_register;
+      }
+    });
+  }
+  std::for_each(threads.begin(), threads.end(), [&] (thread& t) { t.join(); });
+  ASSERT_EQ(1, success_count_begin);
+  ASSERT_LE(1, success_count_register);
 }
 
 class MultiServerTxnStatusTableITest : public TxnStatusTableITest {
@@ -708,14 +838,140 @@ TEST_F(MultiServerTxnStatusTableITest, TestSystemClientCrashedNodes) {
   ASSERT_FALSE(leader_uuid.empty());
   FLAGS_leader_failure_max_missed_heartbeat_periods = 1;
   cluster_->mini_tablet_server_by_uuid(leader_uuid)->Shutdown();
-  // We have to wait for a leader to be elected. Until that happens, the system
-  // client may try to start transactions on followers, and in doing so use up
-  // transaction IDs. Have the system client try again with a higher
-  // transaction ID until a leader is elected.
-  int txn_id = 2;
+  ASSERT_OK(txn_sys_client_->BeginTransaction(2, kUser));
+}
+
+enum InjectedErrorType {
+  kFailoverTimeoutError,
+  kLeaderStatusError,
+  kLoadFromTabletError
+};
+class TxnStatusTableRetryITest : public MultiServerTxnStatusTableITest,
+                                 public ::testing::WithParamInterface<InjectedErrorType> {
+};
+
+TEST_P(TxnStatusTableRetryITest, TestRetryOnError) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  auto error_type = GetParam();
+  switch (error_type) {
+    case kFailoverTimeoutError:
+      FLAGS_txn_status_tablet_failover_inject_timeout_error = true;
+      break;
+    case kLeaderStatusError:
+      FLAGS_txn_status_tablet_inject_uninitialized_leader_status_error = true;
+      break;
+    case kLoadFromTabletError:
+      FLAGS_txn_status_tablet_inject_load_failure_error = true;
+      break;
+  }
+  // Find the leader and force it to step down. The system client should be
+  // able to find the new leader.
+  const string& tablet_id = GetTabletId();
+  ASSERT_FALSE(tablet_id.empty());
+  string orig_leader_uuid;
+  ASSERT_OK(FindLeaderId(tablet_id, &orig_leader_uuid));
+  ASSERT_FALSE(orig_leader_uuid.empty());
+  cluster_->mini_tablet_server_by_uuid(
+      orig_leader_uuid)->server()->mutable_quiescing()->store(true);
+
+  string new_leader_uuid;
+  TxnStatusEntryPB txn_status;
   ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(txn_sys_client_->BeginTransaction(++txn_id, kUser));
+    ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
+    ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    Status s = txn_sys_client_->GetTransactionStatus(1, kUser, &txn_status);
+    ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
   });
+  orig_leader_uuid = new_leader_uuid;
+  // After disabling fault injection flag, calls should succeed given
+  // the failed ones will be retried.
+  switch (error_type) {
+    case kFailoverTimeoutError:
+      FLAGS_txn_status_tablet_failover_inject_timeout_error = false;
+      break;
+    case kLeaderStatusError:
+      FLAGS_txn_status_tablet_inject_uninitialized_leader_status_error = false;
+      break;
+    case kLoadFromTabletError:
+      FLAGS_txn_status_tablet_inject_load_failure_error = false;
+      break;
+  }
+  cluster_->mini_tablet_server_by_uuid(
+      orig_leader_uuid)->server()->mutable_quiescing()->store(true);
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(FindLeaderId(tablet_id, &new_leader_uuid));
+    ASSERT_NE(new_leader_uuid, orig_leader_uuid);
+    ASSERT_OK(txn_sys_client_->GetTransactionStatus(1, kUser, &txn_status));
+  });
+}
+
+// Test that calls to transaction status tablets will retry when:
+//   1) timeout on waiting the replica to catch up with all replicated
+//      operations in previous term.
+//   2) leader status is not initialized yet.
+INSTANTIATE_TEST_SUITE_P(TestTxnStatusTableRetryOnError,
+                         TxnStatusTableRetryITest,
+                         ::testing::Values(kFailoverTimeoutError,
+                                           kLeaderStatusError,
+                                           kLoadFromTabletError));
+
+class TxnStatusTableElectionStormITest : public TxnStatusTableITest {
+ public:
+  void SetUp() override {
+    KuduTest::SetUp();
+
+    // Make leader elections more frequent to get through this test a bit more
+    // quickly.
+    FLAGS_leader_failure_max_missed_heartbeat_periods = 1;
+    FLAGS_raft_heartbeat_interval_ms = 30;
+    InternalMiniClusterOptions opts;
+    opts.num_tablet_servers = 3;
+    cluster_.reset(new InternalMiniCluster(env_, std::move(opts)));
+    ASSERT_OK(cluster_->Start());
+    ASSERT_OK(TxnSystemClient::Create(cluster_->master_rpc_addrs(), &txn_sys_client_));
+
+    // Create the initial transaction status table partitions.
+    ASSERT_OK(txn_sys_client_->CreateTxnStatusTable(100, 3));
+    ASSERT_OK(txn_sys_client_->OpenTxnStatusTable());
+
+   // Inject latency so elections become more frequent and wait a bit for our
+   // latency injection to kick in.
+   FLAGS_raft_enable_pre_election = false;
+   FLAGS_consensus_inject_latency_ms_in_notifications = 1.5 * FLAGS_raft_heartbeat_interval_ms;
+   SleepFor(MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms * 2));
+  }
+};
+
+TEST_F(TxnStatusTableElectionStormITest, TestFrequentElections) {
+  // Ensure concurrent transaction read and write work as expected under frequent
+  // leader elections.
+  const int kNumTxnsPerThread = 5;
+  const int kNumThreads = 5;
+  vector<thread> threads;
+  for (int t = 0; t < kNumThreads; t++) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < kNumTxnsPerThread; i++) {
+        int txn_id = t * kNumTxnsPerThread + i;
+        TxnStatusEntryPB txn_status;
+        Status s = txn_sys_client_->BeginTransaction(txn_id, kUser);
+        // As we don't have guarantee of the threads' execution order, transactions to
+        // be created later can have lower txn ID than previous created ones, which is
+        // not allowed.
+        if (s.ok()) {
+          // Make sure a re-election happens before the following read.
+          SleepFor(MonoDelta::FromMilliseconds(3 * FLAGS_raft_heartbeat_interval_ms));
+
+          CHECK_OK(txn_sys_client_->GetTransactionStatus(txn_id, kUser, &txn_status));
+          CHECK(txn_status.has_user());
+          CHECK_STREQ(kUser, txn_status.user().c_str());
+          CHECK(txn_status.has_state());
+          CHECK_EQ(TxnStatePB::OPEN, txn_status.state());
+        }
+      }
+    });
+  }
+  std::for_each(threads.begin(), threads.end(), [&] (thread& t) { t.join(); });
 }
 
 } // namespace itest

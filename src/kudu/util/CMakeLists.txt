@@ -197,6 +197,7 @@ set(UTIL_SRCS
   locks.cc
   logging.cc
   maintenance_manager.cc
+  maintenance_manager_metrics.cc
   malloc.cc
   memcmpable_varint.cc
   memory/arena.cc
@@ -391,6 +392,7 @@ target_link_libraries(kudu_test_util
   gflags
   glog
   gmock
+  gtest
   kudu_util)
 
 #######################################
@@ -404,6 +406,7 @@ if(NOT NO_TESTS)
     gflags
     glog
     gmock
+    gtest
     kudu_util
     kudu_test_util)
 

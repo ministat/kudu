@@ -16,6 +16,7 @@
 // under the License.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,7 @@
 namespace kudu {
 class HostPort;
 class Timestamp;
+class ThreadPool;
 
 namespace client {
 class KuduClient;
@@ -43,7 +45,12 @@ class KuduTable;
 namespace itest {
 class TxnStatusTableITest;
 class TxnStatusTableITest_TestProtectCreateAndAlter_Test;
+class TxnStatusTableITest_CheckOpenTxnStatusTable_Test;
 } // namespace itest
+
+namespace rpc {
+class Messenger;
+} // namespace rpc
 
 namespace tserver {
 class CoordinatorOpPB;
@@ -131,6 +138,11 @@ class TxnSystemClient {
   // masters.
   Status OpenTxnStatusTable();
 
+  // Check if the transaction status table is already open, returning
+  // Status::OK() if so. Otherwise, open the transaction status table. In the
+  // latter case, the result status of opening the table is returned.
+  Status CheckOpenTxnStatusTable();
+
   // Sends an RPC to the leader of the given tablet to participate in a
   // transaction.
   //
@@ -140,10 +152,16 @@ class TxnSystemClient {
                                   const tserver::ParticipantOpPB& participant_op,
                                   const MonoDelta& timeout,
                                   Timestamp* begin_commit_timestamp = nullptr);
+  void ParticipateInTransactionAsync(const std::string& tablet_id,
+                                     tserver::ParticipantOpPB participant_op,
+                                     const MonoDelta& timeout,
+                                     StatusCallback cb,
+                                     Timestamp* begin_commit_timestamp = nullptr);
  private:
 
   friend class itest::TxnStatusTableITest;
   FRIEND_TEST(itest::TxnStatusTableITest, TestProtectCreateAndAlter);
+  FRIEND_TEST(itest::TxnStatusTableITest, CheckOpenTxnStatusTable);
 
   explicit TxnSystemClient(client::sp::shared_ptr<client::KuduClient> client)
       : client_(std::move(client)) {}
@@ -158,12 +176,6 @@ class TxnSystemClient {
                                     const StatusCallback& cb,
                                     tserver::CoordinatorOpResultPB* result = nullptr);
 
-  void ParticipateInTransactionAsync(const std::string& tablet_id,
-                                     tserver::ParticipantOpPB participant_op,
-                                     const MonoDelta& timeout,
-                                     StatusCallback cb,
-                                     Timestamp* begin_commit_timestamp = nullptr);
-
   client::sp::shared_ptr<client::KuduTable> txn_status_table() {
     std::lock_guard<simple_spinlock> l(table_lock_);
     return txn_status_table_;
@@ -173,6 +185,49 @@ class TxnSystemClient {
 
   simple_spinlock table_lock_;
   client::sp::shared_ptr<client::KuduTable> txn_status_table_;
+};
+
+// Wrapper around a TxnSystemClient that allows callers to asynchronously
+// create a client.
+// TODO(awong): the problem at hand is similar to TxnManager initialization,
+// minus table creation. Refactor for code reuse?
+class TxnSystemClientInitializer {
+ public:
+  TxnSystemClientInitializer();
+  ~TxnSystemClientInitializer();
+
+  // Starts attempts to initialize the transaction system client.
+  Status Init(const std::shared_ptr<rpc::Messenger>& messenger,
+              std::vector<HostPort> master_addrs);
+
+  // Returns a ServiceUnavailable error if the client has not yet been
+  // initialized or if Shutdown() has been called. Otherwise, returns OK and
+  // sets 'client'. Callers should ensure that 'client' is only used while the
+  // TxnSystemClientInitializer is still in scope.
+  Status GetClient(TxnSystemClient** client) const;
+
+  // Like the above, but retries periodically for the client to be initialized
+  // for up to 'timeout', returning a TimedOut error if unable to. Returns a
+  // ServiceUnavailable error if the initializer has been being shut down.
+  Status WaitForClient(const MonoDelta& timeout, TxnSystemClient** client) const;
+
+  // Stops the initialization, preventing success of further calls to
+  // GetClient().
+  void Shutdown();
+
+ private:
+  // Whether or not 'txn_client_' has been initialized.
+  std::atomic<bool> init_complete_;
+
+  // Whether or not the client initializer is shutting down, in which case
+  // attempts to access 'txn_client_' should fail.
+  std::atomic<bool> shutting_down_;
+
+  // Threadpool on which to schedule attempts to initialize 'txn_client_'.
+  std::unique_ptr<ThreadPool> txn_client_init_pool_;
+
+  // The TxnSystemClient, initialized asynchronously via calls to Init().
+  std::unique_ptr<TxnSystemClient> txn_client_;
 };
 
 } // namespace transactions

@@ -136,7 +136,7 @@ Status OpDriver::Init(unique_ptr<Op> op,
   }
   op_ = std::move(op);
 
-  if (type == consensus::REPLICA) {
+  if (type == consensus::FOLLOWER) {
     std::lock_guard<simple_spinlock> lock(opid_lock_);
     op_id_copy_ = op_->state()->op_id();
     DCHECK(op_id_copy_.IsInitialized());
@@ -209,7 +209,7 @@ string OpDriver::ToStringUnlocked() const {
 }
 
 
-Status OpDriver::ExecuteAsync() {
+void OpDriver::ExecuteAsync() {
   VLOG_WITH_PREFIX(4) << "ExecuteAsync()";
   TRACE_EVENT_FLOW_BEGIN0("op", "ExecuteAsync", this);
   ADOPT_TRACE(trace());
@@ -225,12 +225,9 @@ Status OpDriver::ExecuteAsync() {
     s = prepare_pool_token_->Submit([this]() { this->PrepareTask(); });
   }
 
-  if (!s.ok()) {
+  if (PREDICT_FALSE(!s.ok())) {
     HandleFailure(s);
   }
-
-  // TODO: make this return void
-  return Status::OK();
 }
 
 void OpDriver::PrepareTask() {
@@ -293,7 +290,7 @@ Status OpDriver::Prepare() {
     // atomically with the change of the prepared state. Otherwise if the
     // prepare thread gets preempted after the state is prepared apply can be
     // triggered by another thread without the rpc being registered.
-    if (op_->type() == consensus::REPLICA) {
+    if (op_->type() == consensus::FOLLOWER) {
       RegisterFollowerOpOnResultTracker();
     // ... else we're a client-started op. Make sure we're still the driver of the
     // RPC and give up if we aren't.
@@ -342,7 +339,7 @@ Status OpDriver::Prepare() {
     }
     case REPLICATION_FAILED:
       DCHECK(!op_status_.ok());
-      FALLTHROUGH_INTENDED;
+      [[fallthrough]];
     case REPLICATED:
     {
       // We can move on to apply.
@@ -379,7 +376,7 @@ void OpDriver::HandleFailure(const Status& s) {
             << ": " << op_status_.ToString()
             << " op:" << ToString();
       }
-      FALLTHROUGH_INTENDED;
+      [[fallthrough]];
     }
     case NOT_REPLICATING:
     case REPLICATION_FAILED:

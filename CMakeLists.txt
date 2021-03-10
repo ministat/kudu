@@ -119,6 +119,17 @@ add_custom_command(OUTPUT ${GRADLE_WRAPPER_JAR}
   WORKING_DIRECTORY "${JAVA_DIR}")
 add_custom_target(init_gradle DEPENDS ${GRADLE_WRAPPER_JAR})
 
+# A target to build the kudu-proto Java module which is used
+# by the kudu-subprocess and kudu-hive modules to avoid building
+# multiple times and potential race conditions in Gradle code
+# generation.
+set(PROTO_JAR ${JAVA_DIR}/kudu-proto/build/libs/kudu-proto-${KUDU_VERSION_NUMBER}.jar)
+add_custom_command(OUTPUT ${PROTO_JAR}
+        COMMAND ./gradlew :kudu-proto:jar ${GRADLE_FLAGS}
+        WORKING_DIRECTORY "${JAVA_DIR}"
+        DEPENDS init_gradle)
+add_custom_target(proto_jar DEPENDS ${PROTO_JAR})
+
 # Allow "make install" to not depend on all targets.
 #
 # Must be declared in the top-level CMakeLists.txt.
@@ -979,10 +990,17 @@ list(APPEND KUDU_BASE_LIBS gflags)
 
 ## GMock
 find_package(GMock REQUIRED)
-include_directories(SYSTEM ${GMOCK_INCLUDE_DIR} ${GTEST_INCLUDE_DIR})
+include_directories(SYSTEM ${GMOCK_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(gmock
-  STATIC_LIB ${GMOCK_STATIC_LIBRARY}
-  SHARED_LIB ${GMOCK_SHARED_LIBRARY})
+  STATIC_LIB "${GMOCK_STATIC_LIBRARY}"
+  SHARED_LIB "${GMOCK_SHARED_LIBRARY}")
+
+## GTest
+find_package(GTest REQUIRED)
+include_directories(SYSTEM ${GTEST_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(gtest
+  STATIC_LIB "${GTEST_STATIC_LIBRARY}"
+  SHARED_LIB "${GTEST_SHARED_LIBRARY}")
 
 ## Protobuf
 find_package(Protobuf REQUIRED)
